@@ -1,34 +1,42 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-//use std::ops::Deref;
+use std::cmp::*;
+use std::ops::Deref;
 
-#[derive(Clone)]
-enum InfoNode {
+use failure::{bail, ensure, format_err, Error, Fallible};
+
+macro_rules! search_then {
+    () => {};
+}
+
+#[derive(Eq)]
+pub enum InfoNode {
     Info(String),
-    Dir(String, bool, Rc<RefCell<Vec<InfoNode>>>),
+    Dir(String, bool, Vec<InfoNode>),
 }
 
 impl InfoNode {
-    fn get_node_name(&self) -> &String {
+    fn get_name(&self) -> &String {
         match self {
             InfoNode::Info(name) => name,
-            InfoNode::Dir(name, _, _) => name,
+            InfoNode::Dir(name, ..) => name,
         }
     }
+}
 
-    fn set_node_name(&mut self, name: String) {
-        match self {
-            InfoNode::Info(sn) => *sn = name,
-            InfoNode::Dir(dn, _, _) => *dn = name,
-        }
+impl PartialEq for InfoNode {
+    fn eq(&self, other: &InfoNode) -> bool {
+        self.get_name() == other.get_name()
     }
+}
 
-    /// 打开目录
-    fn expand_dir(&mut self) {
-        if let InfoNode::Dir(_, is_expand, _) = self {
-            *is_expand = true;
-        }
+impl PartialOrd for InfoNode {
+    fn partial_cmp(&self, other: &InfoNode) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InfoNode {
+    fn cmp(&self, other: &InfoNode) -> Ordering {
+        self.get_name().cmp(other.get_name())
     }
 }
 
@@ -38,140 +46,96 @@ struct InfoTree {
 }
 
 impl InfoTree {
-    /// return is_continue walk 是否继续遍历
-    /// F: FnMut(pwd, cur_node) -> is_continue
-    /// pwd: 当前节点的目录， cur_node: 当前节点 is_continue: 是否继续遍历
-    fn walk_node<F>(pwd: &String, node: &mut InfoNode, f: &mut F) -> bool
-    where
-        F: FnMut(&String, &mut InfoNode) -> bool,
-    {
-        if pwd != "" && !f(pwd, node) {
-            return false;
-        }
-
-        if let InfoNode::Dir(name, is_expand, node_vec) = node {
-            if !*is_expand {
-                return true;
-            }
-
-            let mut pwd = pwd.clone();
-            pwd.push('/');
-            pwd.push_str(name);
-            for node in node_vec.borrow_mut().iter_mut() {
-                if !InfoTree::walk_node(&pwd, node, f) {
-                    return false;
+    fn insert(&mut self, path: String, is_dir: bool) -> Fallible<()> {
+        let path_vec: Vec<&str> = path.split('/').filter(|node| node != &"").collect();
+        let path_len = path_vec.len();
+        ensure!(path_len > 0, format_err!("path error: {}", path));
+        let last_index = path_len - 1;
+        let mut cur_node = &mut self.root;
+        for pn in path_vec[0..last_index].iter() {
+            match cur_node {
+                InfoNode::Info(name) => {
+                    return Err(format_err!("node: {} is info node, need dir node", name))
                 }
-            }
-        }
-        true
-    }
-
-    /// 更新视图
-    fn update_view(&mut self) {
-        let root = &mut self.root;
-        let view = &mut self.view;
-        InfoTree::walk_node(&"".into(), root, &mut |pwd, node| {
-            view.push(pwd.clone() + node.get_node_name());
-            true
-        });
-    }
-
-    /// node: 需要插入的节点
-    /// view_index: 插入的位置在view中的索引
-    /// return： 是否成功
-    fn insert_node(&mut self, elem: InfoNode, view_index: isize) {
-        let root = &mut self.root;
-        let mut cur_index = view_index;
-        let mut map_node = HashMap::new();
-        if let InfoNode::Dir(_, _, rc_node_vec) = root {
-            map_node.insert(String::from("/"), rc_node_vec.clone());
-        }
-        InfoTree::walk_node(&"".into(), root, &mut |pwd, node| {
-            if cur_index > 0 {
-                if let InfoNode::Dir(name, is_expand, nv) = node {
-                    if *is_expand {
-                        let mut pwd = pwd.clone();
-                        pwd.push('/');
-                        pwd.push_str(name);
-                        map_node.entry(pwd).or_insert(nv.clone());
+                InfoNode::Dir(_, _, node_vec) => {
+                    match node_vec.binary_search_by(|node| pn.deref().cmp(node.get_name())) {
+                        Ok(index) => {
+                            cur_node = unsafe { node_vec.get_unchecked_mut(index) };
+                        }
+                        Err(index) => {
+                            node_vec.insert(index, InfoNode::Dir(pn.to_string(), true, Vec::new()));
+                            cur_node = unsafe { node_vec.get_unchecked_mut(index) };
+                        }
                     }
                 }
-                cur_index -= 1;
-                return true;
             }
+        }
 
-            let node_vec = map_node.get_mut(pwd).unwrap();
-            node_vec.borrow_mut().push(elem.clone());
-            false
-        });
-        self.update_view();
-    }
-
-    /// 更新节点(重命名)
-    /// 通过view索引去定位元素
-    /// return: 是否成功
-    fn update_node(&mut self, node_name: &String, view_index: isize) {
-        let mut index = view_index;
-        let root = &mut self.root;
-        InfoTree::walk_node(&"".into(), root, &mut |_, node| {
-            if index > 0 {
-                index -= 1;
-                return true
+        match cur_node {
+            InfoNode::Info(name) => {
+                return Err(format_err!("node: {} is info node, need dir node", name))
             }
-            
-            node.set_node_name(node_name.clone());
-            false
-        });
-        self.update_view();
-    }
-
-    /// 打开目录
-    fn expand_dir(&mut self, view_index: isize) {
-        let mut index = view_index;
-        let root = &mut self.root;
-        InfoTree::walk_node(&"".into(), root, &mut |_, node| {
-            if index > 0 {
-                index -= 1;
-                return true
-            }
-
-            node.expand_dir();
-            false
-        });
-        self.update_view();
-    }
-
-    /// 通过视图索引删除节点
-    /// return: 是否成功
-    fn delete_node_by_index(&mut self, view_index: isize) {
-        let mut index = view_index;
-        let root  = &mut self.root;
-        let mut dir_cache = HashMap::new();
-        let mut index_cache = HashMap::new();
-        InfoTree::walk_node(&"".into(), root, &mut |pwd, node| {
-            if index > 0 {
-                index -= 1;
-                if let InfoNode::Dir(name, is_expand, node_vec) = node {
-                    if ! *is_expand {
-                        return true
+            InfoNode::Dir(_, _, node_vec) => {
+                let name = unsafe { path_vec.get_unchecked(last_index) };
+                match node_vec.binary_search_by(|node| name.deref().cmp(node.get_name())) {
+                    Ok(_) => return Err(format_err!("path exist")),
+                    Err(index) => {
+                        let inserted_node = if is_dir {
+                            InfoNode::Dir(name.to_string(), true, Vec::new())
+                        } else {
+                            InfoNode::Info(name.to_string())
+                        };
+                        node_vec.insert(index, inserted_node);
                     }
-
-                    let mut node_pwd = pwd.clone();
-                    node_pwd.push('/');
-                    node_pwd.push_str(name);
-                    dir_cache.insert(node_pwd.clone(), node_vec.clone());
-                    index_cache.insert(node_pwd, 0);
                 }
-                *index_cache.get_mut(pwd).unwrap() += 1;
-                return true
             }
+        }
 
-            // 删除
-            let index = *index_cache.get_mut(pwd).unwrap();
-            let v = dir_cache.get_mut(pwd).unwrap();
-            v.borrow_mut().remove(index);
-            false
-        });
-        self.update_view();
+        Ok(())
+    }
+
+    fn visit(&self) {}
+
+    fn update(&mut self, old_path: String, new_path: String, is_dir: bool) -> Fallible<()> {
+        // 先把旧的删了
+        let old_path_vec: Vec<&str> = old_path.split('/').filter(|o| o != &"").collect();
+        let old_len = old_path_vec.len();
+        if old_len == 0 {
+            return self.insert(new_path, is_dir);
+        }
+        let old_last = old_len - 1;
+        let mut node_iter = &mut self.root;
+        for old in old_path_vec[..old_last].iter() {
+            match node_iter {
+                InfoNode::Info(name) => return Err(format_err!("node {} is info, need dir", name)),
+                InfoNode::Dir(_, _, node_vec) => {
+                    match node_vec.binary_search_by(|n| old.deref().cmp(n.get_name())) {
+                        Err(_) => return Err(format_err!("node {} is not exist", old)),
+                        Ok(index) => node_iter = unsafe { node_vec.get_unchecked_mut(index) },
+                    }
+                }
+            }
+        }
+
+        match node_iter {
+            InfoNode::Info(name) => return Err(format_err!("node {} is info, need dir", name)),
+            InfoNode::Dir(_, _, node_vec) => {
+
+ //               #[allow(unused)]
+                node_vec
+                    .binary_search_by(|n| unsafe {
+                        old_path_vec
+                            .get_unchecked(old_last)
+                            .deref()
+                            .cmp(n.get_name())
+                    })
+                    .and_then(|index| {
+                        node_vec.remove(index);
+                        Ok(())
+                    });
+            }
+        }
+
+        self.insert(new_path, is_dir)
     }
 }
