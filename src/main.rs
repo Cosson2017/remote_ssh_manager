@@ -5,6 +5,7 @@ mod rsm_file;
 mod rsm_config;
 //mod rsm_data_hash;
 //mod rsm_data_map;
+mod tui_spawn;
 
 
 fn main() {
